@@ -15,17 +15,75 @@ from deepmd.dpmodel.common import (
     get_xp_precision,
 )
 from deepmd.dpmodel.descriptor.dpa4_nn.embedding import (
+    EnvironmentInitialEmbedding as EnvironmentInitialEmbeddingDP,
+)
+from deepmd.dpmodel.descriptor.dpa4_nn.embedding import (
     GeometricInitialEmbedding as GeometricInitialEmbeddingDP,
 )
 from deepmd.pt_expt.common import (
+    register_dpmodel_mapping,
     torch_module,
 )
 from deepmd.pt_expt.kernels.utils import (
     cuda_infer_level,
+    tilelang_operator_enabled,
 )
 
 from .edge_cache import (
     cached_edge_csr,
+)
+
+
+@torch_module
+class EnvironmentInitialEmbedding(EnvironmentInitialEmbeddingDP):
+    """Environment-seed embedding with an opt-in TileLang scatter stage."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._tilelang_scatter_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_ENV_SEED_SCATTER"
+        )
+
+    def _aggregate_environment(
+        self,
+        r_tilde: torch.Tensor,
+        features: torch.Tensor,
+        edge_cache: Any,
+        n_nodes: int,
+    ) -> torch.Tensor:
+        if self._tilelang_scatter_enabled:
+            if self.training:
+                raise RuntimeError("DP_TILELANG_ENV_SEED_SCATTER is inference-only")
+            if (
+                r_tilde.dtype != torch.float32
+                or not r_tilde.is_cuda
+                or torch.version.hip is None
+            ):
+                raise RuntimeError(
+                    "TileLang environment-seed scatter requires float32 HIP/DCU tensors"
+                )
+            if (
+                self.spin_flags is not None
+                or edge_cache.edge_src_gate is not None
+                or edge_cache.edge_mask is not None
+            ):
+                raise RuntimeError(
+                    "TileLang environment-seed scatter does not support spin, masks or bridging"
+                )
+            from kernels.tilelang_ops import tilelang_environment_seed_scatter
+
+            return tilelang_environment_seed_scatter(
+                r_tilde.contiguous(),
+                features.contiguous(),
+                edge_cache.dst.contiguous(),
+                edge_cache.inv_sqrt_deg.reshape(-1).contiguous(),
+            )
+        return super()._aggregate_environment(r_tilde, features, edge_cache, n_nodes)
+
+
+register_dpmodel_mapping(
+    EnvironmentInitialEmbeddingDP,
+    lambda v: EnvironmentInitialEmbedding.deserialize(v.serialize()),
 )
 
 
@@ -40,6 +98,9 @@ class GeometricInitialEmbedding(GeometricInitialEmbeddingDP):
         # (E, D-1, C) tensor that dominates the cost of this module. The fused
         # operator keeps it in registers and reduces through the destination CSR.
         self._cuda_scatter = False
+        self._tilelang_scatter_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_ZONAL_SCATTER"
+        )
         # ``None`` keeps the runtime ``zonal_coupling.is_cuda`` dispatch; the
         # freeze pins it to the AOTI target because tracing always runs on CPU.
         self._force_fused_scatter: bool | None = None
@@ -56,8 +117,39 @@ class GeometricInitialEmbedding(GeometricInitialEmbeddingDP):
                 self.lmax, self.ebed_dim - 1, self.channels
             )
 
+    def call(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        if self._tilelang_scatter_enabled:
+            edge_cache = kwargs.get("edge_cache")
+            if edge_cache is None:
+                raise RuntimeError("TileLang zonal scatter requires an edge cache")
+            if kwargs.get("spin_l1_message") is not None:
+                raise RuntimeError(
+                    "TileLang zonal scatter does not support spin messages"
+                )
+            if edge_cache.edge_src_gate is not None:
+                raise RuntimeError(
+                    "TileLang zonal scatter does not support bridging gates"
+                )
+            if edge_cache.csr_cache is None:
+                raise RuntimeError(
+                    "TileLang zonal scatter requires the standard edge cache"
+                )
+        return super().call(*args, **kwargs)
+
     def _can_fuse_scatter(self, zonal_coupling: torch.Tensor) -> bool:
-        """Return whether the fused scatter serves the runtime or trace target."""
+        """Return whether a selected scatter implementation serves this call."""
+        if self._tilelang_scatter_enabled:
+            if self.training:
+                raise RuntimeError("DP_TILELANG_ZONAL_SCATTER is inference-only")
+            if (
+                zonal_coupling.dtype != torch.float32
+                or not zonal_coupling.is_cuda
+                or torch.version.hip is None
+            ):
+                raise RuntimeError(
+                    "TileLang zonal scatter requires float32 HIP/DCU tensors"
+                )
+            return True
         target_is_cuda = (
             zonal_coupling.is_cuda
             if self._force_fused_scatter is None
@@ -93,6 +185,22 @@ class GeometricInitialEmbedding(GeometricInitialEmbeddingDP):
         torch.Tensor
             Initial features to add with shape (N, D, C), with l=0 zero.
         """
+        if self._tilelang_scatter_enabled:
+            from kernels.tilelang_ops import tilelang_zonal_scatter
+
+            radial_slot = torch.as_tensor(
+                self.radial_slot_index_for_row,
+                dtype=torch.int64,
+                device=radial_feat.device,
+            )
+            return tilelang_zonal_scatter(
+                zonal_coupling.contiguous(),
+                radial_feat.contiguous(),
+                edge_cache.dst.contiguous(),
+                radial_slot,
+                edge_cache.inv_sqrt_deg.reshape(-1).contiguous(),
+            )
+
         from deepmd.pt_expt.kernels.cuda.dpa4.zonal_scatter import (
             zonal_scatter,
         )

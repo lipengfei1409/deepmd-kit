@@ -40,6 +40,7 @@ from deepmd.pt_expt.common import (
     torch_module,
 )
 from deepmd.pt_expt.kernels.utils import (
+    tilelang_operator_enabled,
     triton_infer_level,
     use_cutile_infer,
 )
@@ -84,6 +85,7 @@ class WignerDCalculator(WignerDCalculatorDP):
         precision: str = DEFAULT_PRECISION,
     ) -> None:
         super().__init__(lmax, eps=eps, precision=precision)
+        self._tilelang_l1_enabled = tilelang_operator_enabled("DP_TILELANG_WIGNER_L1")
         if self.lmax >= 2:
             # Flatten the monomial exponent tables to Python constants in
             # eager context: the fused monomial operator bakes them into the
@@ -163,6 +165,24 @@ class WignerDCalculator(WignerDCalculatorDP):
             buffer_name = f"{_SMALL_ORDER_PREFIX}{name}"
             setattr(self, buffer_name, array)
             setattr(kernels, name, getattr(self, buffer_name))
+
+    def call(self, edge_quaternion: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self._tilelang_l1_enabled:
+            return super().call(edge_quaternion)
+        if self.training:
+            raise RuntimeError("DP_TILELANG_WIGNER_L1 is inference-only")
+        if self.lmax != 1:
+            raise RuntimeError("TileLang Wigner-D currently supports only lmax=1")
+        if (
+            edge_quaternion.dtype != torch.float32
+            or not edge_quaternion.is_cuda
+            or torch.version.hip is None
+        ):
+            raise RuntimeError("TileLang l=1 Wigner-D requires float32 HIP/DCU tensors")
+
+        from kernels.tilelang_ops import tilelang_wigner_l1
+
+        return tilelang_wigner_l1(edge_quaternion, self.eps)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         return self.call(*args, **kwargs)

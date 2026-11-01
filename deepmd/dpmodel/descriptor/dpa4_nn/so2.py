@@ -1985,26 +1985,9 @@ class SO2Convolution(NativeOP):
                 self.head_dim,
             ),
         )  # (E, D, Fa, H, Ch)
-        weighted_value = value_heads * xp.reshape(
-            attn_alpha, (n_edge, 1, self.attn_n_focus, self.n_atten_head, 1)
-        )  # (E, D, Fa, H, Ch)
-        out_heads = xp.zeros(
-            (
-                n_node,
-                self.ebed_dim_full,
-                self.attn_n_focus,
-                self.n_atten_head,
-                self.head_dim,
-            ),
-            dtype=compute_dtype,
-            device=device,
-        )  # (N, D, Fa, H, Ch)
-        out_heads = xp_add_at(out_heads, dst, weighted_value)
-
-        # === Step 6. Output-side head gate ===
-        out_heads = out_heads * xp.reshape(
-            head_gate,
-            (n_node, 1, self.attn_n_focus, self.n_atten_head, 1),
+        # === Step 5. Head-wise weighting and destination reduction ===
+        out_heads = self._attention_weighted_reduce(
+            value_heads, attn_alpha, head_gate, dst, n_node
         )  # (N, D, Fa, H, Ch)
 
         # === Step 7. Output projection and head merge ===
@@ -2016,6 +1999,38 @@ class SO2Convolution(NativeOP):
             out_focus = self.attn_o_proj(out_focus)
         out = xp.reshape(out_focus, (n_node, self.ebed_dim_full, self.hidden_channels))
         return xp.astype(out, get_xp_precision(xp, self.precision))
+
+    def _attention_weighted_reduce(
+        self,
+        value_heads: Array,
+        attn_alpha: Array,
+        head_gate: Array,
+        dst: Array,
+        n_node: int,
+    ) -> Array:
+        """Apply edge attention and reduce messages by destination node."""
+        xp = array_api_compat.array_namespace(value_heads)
+        device = array_api_compat.device(value_heads)
+        n_edge = value_heads.shape[0]
+        weighted_value = value_heads * xp.reshape(
+            attn_alpha, (n_edge, 1, self.attn_n_focus, self.n_atten_head, 1)
+        )
+        out_heads = xp.zeros(
+            (
+                n_node,
+                self.ebed_dim_full,
+                self.attn_n_focus,
+                self.n_atten_head,
+                self.head_dim,
+            ),
+            dtype=value_heads.dtype,
+            device=device,
+        )
+        out_heads = xp_add_at(out_heads, dst, weighted_value)
+        return out_heads * xp.reshape(
+            head_gate,
+            (n_node, 1, self.attn_n_focus, self.n_atten_head, 1),
+        )
 
     def attention_qk(self, x_l0_node: Array) -> tuple[Array, Array]:
         """
@@ -2645,7 +2660,7 @@ class SO2Convolution(NativeOP):
         if self.radial_hidden_proj is not None:
             rad_feat = self.radial_hidden_proj(rad_feat)
         if self.radial_degree_mixer is None:
-            x_local = x_local * rad_feat
+            x_local = self._apply_radial_scale(x_local, rad_feat)
         else:
             x_local = self.radial_degree_mixer(x_local, rad_feat)
         if self.node_wise_grid_product is not None:
@@ -2660,6 +2675,10 @@ class SO2Convolution(NativeOP):
             (2, 0, 1, 3),
         )  # (F, E, D_m, Cf), strided view
         return x_local, rad_feat
+
+    def _apply_radial_scale(self, x_local: Array, radial_feat: Array) -> Array:
+        """Apply the ordinary per-degree radial modulation."""
+        return x_local * radial_feat
 
     def _rotate_back(self, x_local: Array, edge_cache: EdgeCache, n_edge: int) -> Array:
         """

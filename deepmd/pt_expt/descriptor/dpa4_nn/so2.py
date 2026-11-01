@@ -38,6 +38,7 @@ from deepmd.pt_expt.common import (
 from deepmd.pt_expt.kernels.utils import (
     cuda_infer_level,
     cuda_train_enabled,
+    tilelang_operator_enabled,
     triton_infer_level,
     triton_train_level,
     use_cute_infer,
@@ -86,6 +87,9 @@ class SO2Linear(SO2LinearDP):
         # ``None`` keeps the runtime ``x_flat.is_cuda`` dispatch; the freeze sets
         # it so the AOTI graph follows the *target* device, not the CPU trace.
         self._force_block_diag_matmul: bool | None = None
+        self._tilelang_l1_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_SO2_LINEAR_L1"
+        )
 
         # Fast path (``DP_TRITON_INFER >= 1`` or ``DP_TRITON_TRAIN >= 1``):
         # the per-|m|-block batched bmm + cat of ``_block_diagonal_matmul`` is
@@ -114,6 +118,25 @@ class SO2Linear(SO2LinearDP):
     def _block_diagonal_matmul(
         self, x_flat: torch.Tensor, weight: torch.Tensor
     ) -> torch.Tensor:
+        if self._tilelang_l1_enabled:
+            if self.training:
+                raise RuntimeError("DP_TILELANG_SO2_LINEAR_L1 is inference-only")
+            if self.lmax != 1 or self.mmax != 1:
+                raise RuntimeError(
+                    "TileLang SO2Linear currently supports only lmax=mmax=1"
+                )
+            if (
+                x_flat.dtype != torch.float32
+                or not x_flat.is_cuda
+                or torch.version.hip is None
+            ):
+                raise RuntimeError(
+                    "TileLang SO2Linear requires float32 HIP/DCU tensors"
+                )
+            from kernels.tilelang_ops import tilelang_so2_linear_l1
+
+            return tilelang_so2_linear_l1(x_flat, weight)
+
         # The dense einsum is a CPU-only fallback: its block ``torch.cat`` lowering
         # trips an Inductor AVX2 C++ codegen bug, so only CPU needs it. Every other
         # device uses the block-diagonal contraction, which skips the structural
@@ -191,6 +214,25 @@ class SO2Convolution(SO2ConvolutionDP):
         self.use_triton_infer = self.triton_infer_level >= 1
         self.use_cute_infer = use_cute_infer()
         self.use_cutile_infer = use_cutile_infer()
+        self._tilelang_rotation_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_SO2_ROTATION_L1"
+        )
+        self._tilelang_attention_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_ATTENTION_SOFTMAX"
+        )
+        self._tilelang_attention_aggregate_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_ATTENTION_AGGREGATE"
+        )
+        self._tilelang_radial_scale_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_SO2_RADIAL_SCALE"
+        )
+        if self._tilelang_rotation_enabled and (
+            self.use_triton_infer or self.use_cute_infer or self.use_cutile_infer
+        ):
+            raise ValueError(
+                "DP_TILELANG_SO2_ROTATION_L1 cannot be combined with the Triton, "
+                "CuTe or cuTile SO(2) inference paths"
+            )
         if sum((self.use_triton_infer, self.use_cute_infer, self.use_cutile_infer)) > 1:
             raise ValueError(
                 "DP_TRITON_INFER, DP_CUTE_INFER and DP_CUTILE_INFER are mutually "
@@ -304,6 +346,26 @@ class SO2Convolution(SO2ConvolutionDP):
             )
 
             self._cuda_conv_fn = make_cuda_so2_conv(self)
+        if self._tilelang_rotation_enabled and self._cuda_conv_fn is not None:
+            raise ValueError(
+                "DP_TILELANG_SO2_ROTATION_L1 cannot be combined with the fused CUDA SO(2) path"
+            )
+        if self._tilelang_attention_aggregate_enabled and (
+            self._cuda_conv_fn is not None
+            or self._flash_atten_fn is not None
+            or self._cuda_value_train is not None
+        ):
+            raise ValueError(
+                "DP_TILELANG_ATTENTION_AGGREGATE cannot be combined with fused SO(2) attention paths"
+            )
+        if self._tilelang_attention_enabled and (
+            self._cuda_conv_fn is not None
+            or self._flash_atten_fn is not None
+            or self._cuda_value_train is not None
+        ):
+            raise ValueError(
+                "DP_TILELANG_ATTENTION_SOFTMAX cannot be combined with fused SO(2) attention paths"
+            )
 
         # === Step 14. Optional fused CuTe SO(2) value-path operator ===
         # Experimental alternative backend; mutually exclusive with the Triton
@@ -408,12 +470,98 @@ class SO2Convolution(SO2ConvolutionDP):
             return x_local, rad_feat
         return super()._rotate_mix(x, edge_cache, radial_feat)
 
+    def _apply_radial_scale(
+        self, x_local: torch.Tensor, radial_feat: torch.Tensor
+    ) -> torch.Tensor:
+        if self._tilelang_radial_scale_enabled:
+            if self.training:
+                raise RuntimeError("DP_TILELANG_SO2_RADIAL_SCALE is inference-only")
+            if (
+                x_local.dtype != torch.float32
+                or not x_local.is_cuda
+                or torch.version.hip is None
+            ):
+                raise RuntimeError(
+                    "TileLang SO2 radial scale requires float32 HIP/DCU tensors"
+                )
+            from kernels.tilelang_ops import tilelang_so2_radial_scale
+
+            # The caller's local edge layout is (E, D_m, C_wide).
+            return tilelang_so2_radial_scale(x_local, radial_feat)
+        return super()._apply_radial_scale(x_local, radial_feat)
+
+    def _attention_weighted_reduce(
+        self,
+        value_heads: torch.Tensor,
+        attn_alpha: torch.Tensor,
+        head_gate: torch.Tensor,
+        dst: torch.Tensor,
+        n_node: int,
+    ) -> torch.Tensor:
+        if self._tilelang_attention_aggregate_enabled:
+            if self.training:
+                raise RuntimeError("DP_TILELANG_ATTENTION_AGGREGATE is inference-only")
+            if (
+                value_heads.dtype != torch.float32
+                or not value_heads.is_cuda
+                or torch.version.hip is None
+            ):
+                raise RuntimeError(
+                    "TileLang attention aggregation requires float32 HIP/DCU tensors"
+                )
+            from kernels.tilelang_ops import tilelang_attention_aggregate
+
+            return tilelang_attention_aggregate(
+                value_heads.contiguous(),
+                attn_alpha.contiguous(),
+                head_gate.contiguous(),
+                dst.contiguous(),
+            )
+        return super()._attention_weighted_reduce(
+            value_heads, attn_alpha, head_gate, dst, n_node
+        )
+
     def _attention_softmax(
         self,
         attn_logits: torch.Tensor,
         edge_cache: EdgeCache,
         n_nodes: int,
     ) -> torch.Tensor:
+        if self._tilelang_attention_enabled:
+            if self.training:
+                raise RuntimeError("DP_TILELANG_ATTENTION_SOFTMAX is inference-only")
+            if (
+                attn_logits.dtype != torch.float32
+                or not attn_logits.is_cuda
+                or torch.version.hip is None
+            ):
+                raise RuntimeError(
+                    "TileLang attention softmax requires float32 HIP/DCU tensors"
+                )
+            if edge_cache.edge_src_gate is not None or edge_cache.edge_mask is not None:
+                raise RuntimeError(
+                    "TileLang attention softmax does not support masks or source gates"
+                )
+            from kernels.tilelang_ops import tilelang_segment_envelope_softmax
+
+            n_edges = attn_logits.shape[0]
+            order, row_ptr = cached_edge_csr(edge_cache, "dst", n_nodes)
+            null_logit = torch.log(
+                torch.nn.functional.softplus(
+                    self.adamw_attn_z_bias_raw.to(dtype=torch.float32)
+                )
+                + float(self.eps)
+            )
+            return tilelang_segment_envelope_softmax(
+                attn_logits.contiguous(),
+                edge_cache.edge_env.reshape(n_edges)
+                .to(dtype=torch.float32)
+                .contiguous(),
+                edge_cache.dst.contiguous(),
+                order.contiguous(),
+                row_ptr.contiguous(),
+                null_logit.contiguous(),
+            )
         active_level = _active_triton_level(self)
         if (
             self._segment_softmax_fn is not None
@@ -448,6 +596,20 @@ class SO2Convolution(SO2ConvolutionDP):
             )
         return super()._attention_softmax(attn_logits, edge_cache, n_nodes)
 
+    def _check_tilelang_rotation_inputs(self, value: torch.Tensor) -> None:
+        if self.training:
+            raise RuntimeError("DP_TILELANG_SO2_ROTATION_L1 is inference-only")
+        if self.lmax != 1 or self.mmax != 1:
+            raise RuntimeError(
+                "TileLang SO2 rotation currently supports only lmax=mmax=1"
+            )
+        if (
+            value.dtype != torch.float32
+            or not value.is_cuda
+            or torch.version.hip is None
+        ):
+            raise RuntimeError("TileLang SO2 rotation requires float32 HIP/DCU tensors")
+
     def _rotation_active(self) -> bool:
         """Whether the bound rotation kernels serve the current mode."""
         return self._rotate_to_local_fn is not None and _active_triton_level(self) >= 1
@@ -455,6 +617,19 @@ class SO2Convolution(SO2ConvolutionDP):
     def _rotate_to_local(
         self, x: torch.Tensor, edge_cache: EdgeCache
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self._tilelang_rotation_enabled:
+            self._check_tilelang_rotation_inputs(x)
+            if edge_cache.D_full is None:
+                raise RuntimeError("TileLang SO2 rotation requires full Wigner blocks")
+            from kernels.tilelang_ops import tilelang_rotate_to_local_l1
+
+            x_local = tilelang_rotate_to_local_l1(x, edge_cache.D_full, edge_cache.src)
+            x_dst_local: torch.Tensor | None = None
+            if self.node_wise_grid_product is not None:
+                x_dst_local = tilelang_rotate_to_local_l1(
+                    x, edge_cache.D_full, edge_cache.dst
+                )
+            return x_local, x_dst_local
         if self._rotation_active():
             # ``self._rotate_to_local_fn`` was bound in ``__init__`` (the block
             # kernel for the m-major ``mmax == 1`` layout, dense otherwise).
@@ -469,6 +644,15 @@ class SO2Convolution(SO2ConvolutionDP):
     def _rotate_back(
         self, x_local: torch.Tensor, edge_cache: EdgeCache, n_edge: int
     ) -> torch.Tensor:
+        if self._tilelang_rotation_enabled:
+            self._check_tilelang_rotation_inputs(x_local)
+            if edge_cache.Dt_full is None:
+                raise RuntimeError(
+                    "TileLang SO2 rotation requires full inverse Wigner blocks"
+                )
+            from kernels.tilelang_ops import tilelang_rotate_back_l1
+
+            return tilelang_rotate_back_l1(x_local, edge_cache.Dt_full)
         if self._rotation_active():
             Dt_full = edge_cache.Dt_full
             if self.mmax == 1:

@@ -11,11 +11,18 @@ from deepmd.dpmodel.common import (
 from deepmd.dpmodel.descriptor.dpa4 import DescrptDPA4 as DescrptDPA4DP
 from deepmd.dpmodel.descriptor.dpa4_nn.activation import SwiGLU as SwiGLUDP
 from deepmd.dpmodel.descriptor.dpa4_nn.grid_net import GridProduct as GridProductDP
-from deepmd.dpmodel.descriptor.dpa4_nn.radial import BridgingSwitch as BridgingSwitchDP
+from deepmd.dpmodel.descriptor.dpa4_nn.radial import (
+    BridgingSwitch as BridgingSwitchDP,
+)
 from deepmd.dpmodel.descriptor.dpa4_nn.radial import (
     C3CutoffEnvelope as C3CutoffEnvelopeDP,
 )
-from deepmd.dpmodel.descriptor.dpa4_nn.radial import InnerClamp as InnerClampDP
+from deepmd.dpmodel.descriptor.dpa4_nn.radial import (
+    InnerClamp as InnerClampDP,
+)
+from deepmd.dpmodel.descriptor.dpa4_nn.radial import (
+    RadialBasis as RadialBasisDP,
+)
 from deepmd.pt_expt.common import (
     register_dpmodel_mapping,
     torch_module,
@@ -25,6 +32,8 @@ from deepmd.pt_expt.descriptor.base_descriptor import (
 )
 from deepmd.pt_expt.kernels.utils import (
     cuda_infer_level,
+    tilelang_dpa4_enabled,
+    tilelang_operator_enabled,
     use_amp_infer,
 )
 from deepmd.pt_expt.utils.update_sel import (
@@ -44,8 +53,65 @@ register_dpmodel_mapping(SwiGLUDP, lambda v: SwiGLU())
 
 @torch_module
 class C3CutoffEnvelope(C3CutoffEnvelopeDP):
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
-        return self.call(*args, **kwargs)
+    """C3 cutoff envelope with an opt-in standalone TileLang inference path."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._tilelang_infer_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_C3_ENVELOPE"
+        )
+
+    def forward(self, r: torch.Tensor) -> torch.Tensor:
+        if not self._tilelang_infer_enabled:
+            return self.call(r)
+        if self.training:
+            raise RuntimeError("DP_TILELANG_C3_ENVELOPE is inference-only")
+        if r.dtype != torch.float32 or not r.is_cuda or torch.version.hip is None:
+            raise RuntimeError(
+                "TileLang C3 cutoff envelope requires float32 HIP/DCU tensors"
+            )
+
+        from kernels.tilelang_ops import tilelang_c3_cutoff_envelope
+
+        return tilelang_c3_cutoff_envelope(r, self.rcut, self.p)
+
+
+@torch_module
+class RadialBasis(RadialBasisDP):
+    """Radial basis with an opt-in, standalone TileLang inference path."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._tilelang_infer_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_RADIAL_BASIS"
+        )
+
+    def forward(self, r: torch.Tensor) -> torch.Tensor:
+        if not self._tilelang_infer_enabled:
+            return self.call(r)
+        if self.training:
+            raise RuntimeError("DP_TILELANG_RADIAL_BASIS is inference-only")
+        if self.basis_family != "bessel":
+            raise RuntimeError(
+                "TileLang radial basis currently supports only Bessel basis"
+            )
+        if r.dtype != torch.float32 or not r.is_cuda or torch.version.hip is None:
+            raise RuntimeError("TileLang radial basis requires float32 HIP/DCU tensors")
+
+        from kernels.tilelang_ops import tilelang_bessel_radial_basis
+
+        # Keep the cutoff envelope as an ordinary separate PyTorch op; this
+        # TileLang operator computes only the raw Bessel basis.
+        radial = tilelang_bessel_radial_basis(r, self.adam_freqs)
+        if self.envelope is not None:
+            radial = radial * self.envelope(r)
+        return radial
+
+
+register_dpmodel_mapping(
+    RadialBasisDP,
+    lambda v: RadialBasis.deserialize(v.serialize()),
+)
 
 
 @torch_module
@@ -86,8 +152,57 @@ register_dpmodel_mapping(
 
 @torch_module
 class GridProduct(GridProductDP):
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
-        return self.call(*args, **kwargs)
+    """Pointwise S2 grid product with an opt-in standalone TileLang kernel."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._tilelang_infer_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_GRID_PRODUCT"
+        )
+
+    def call(
+        self,
+        left: torch.Tensor,
+        right: torch.Tensor,
+        scalar_pair: torch.Tensor,
+        *,
+        to_grid: Any,
+        from_grid: Any,
+        pair_grid: Any = None,
+        project_pair: Any = None,
+        scalar_product: Any = None,
+    ) -> torch.Tensor:
+        if not self._tilelang_infer_enabled:
+            return super().call(
+                left,
+                right,
+                scalar_pair,
+                to_grid=to_grid,
+                from_grid=from_grid,
+                pair_grid=pair_grid,
+                project_pair=project_pair,
+                scalar_product=scalar_product,
+            )
+        if self.training:
+            raise RuntimeError("DP_TILELANG_GRID_PRODUCT is inference-only")
+        if pair_grid is not None or scalar_product is not None:
+            raise RuntimeError(
+                "TileLang grid product does not support fused grid callbacks"
+            )
+        if project_pair is None:
+            left_grid, right_grid = to_grid(left), to_grid(right)
+        else:
+            left_grid, right_grid = project_pair(left, right)
+        if (
+            left_grid.dtype != torch.float32
+            or not left_grid.is_cuda
+            or torch.version.hip is None
+        ):
+            raise RuntimeError("TileLang grid product requires float32 HIP/DCU tensors")
+
+        from kernels.tilelang_ops import tilelang_grid_product
+
+        return from_grid(tilelang_grid_product(left_grid, right_grid))
 
 
 # GridProduct is a parameter-free quadratic grid product with no constructor
@@ -213,6 +328,7 @@ class DescrptDPA4(DescrptDPA4DP):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        self._tilelang_dpa4_enabled = tilelang_dpa4_enabled()
         # The fused convolution paths consume only the three structural rows of
         # each Wigner degree block. Source-gated attention bypasses that fused
         # convolution, so its dense per-edge rotations remain available.
@@ -435,6 +551,43 @@ class DescrptDPA4(DescrptDPA4DP):
         self.version = float(self.version_tensor.item())
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
+        if self._tilelang_dpa4_enabled:
+            if self.training:
+                raise RuntimeError("DP_TILELANG_DPA4 is inference-only")
+            if (
+                self.lmax != 1
+                or self.mmax != 1
+                or self.n_focus != 1
+                or self.n_atten_head != 1
+                or self.radial_so2_mode != "none"
+                or self.edge_cartesian
+                or self.bridging_switch is not None
+                or self.spin_embedding is not None
+                or self.charge_spin_embedding is not None
+                or self.so3_readout != "none"
+                or self.use_full_attn_res
+                or self.use_block_attn_res
+                or self.ffn_so3_grid
+                or any(self.grid_mlp)
+                or any(self.grid_branch)
+                or self.node_wise_s2
+                or self.node_wise_so3
+                or self.message_node_s2
+                or self.message_node_so3
+                or self.atten_f_mix
+                or self.use_atten_v_proj
+                or self.use_atten_o_proj
+                or any(
+                    block.so2_conv.node_wise_grid_product is not None
+                    or block.so2_conv.message_node_grid_product is not None
+                    or block.so2_conv.node_cartesian_tp is not None
+                    for block in self.blocks
+                )
+            ):
+                raise RuntimeError(
+                    "DP_TILELANG_DPA4 currently supports the single-focus, lmax=mmax=1 "
+                    "water inference configuration without spin, bridging or SO(3) readout"
+                )
         return self.call(*args, **kwargs)
 
     def _forward_blocks(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:

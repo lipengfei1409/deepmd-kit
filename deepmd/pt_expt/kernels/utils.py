@@ -30,6 +30,20 @@ import torch
 
 _INFER_TRUE = ("1", "true", "yes", "on")
 
+
+def tilelang_dpa4_enabled() -> bool:
+    """Return whether the supported independent DPA4 TileLang path is enabled."""
+    return os.environ.get("DP_TILELANG_DPA4", "0").strip().lower() in _INFER_TRUE
+
+
+def tilelang_operator_enabled(name: str) -> bool:
+    """Return whether a standalone TileLang op or the DPA4 suite is enabled."""
+    return (
+        tilelang_dpa4_enabled()
+        or os.environ.get(name, "0").strip().lower() in _INFER_TRUE
+    )
+
+
 TRITON_INFER_LEVELS = (0, 1, 2, 3)
 
 

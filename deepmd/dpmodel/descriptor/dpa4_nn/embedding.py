@@ -723,46 +723,10 @@ class EnvironmentInitialEmbedding(NativeOP):
         g_input = xp.concat([rbf_proj, type_src, type_dst], axis=-1)  # (E, g_in_dim)
         g = self.g_layer2(self.g_layer1(g_input))  # (E, embed_dim)
 
-        # === Step 3. Aggregate outer product by destination node ===
-        # outer = r_tilde[:, :, None] * g[:, None, :], einsum "ei,ej->eij".
-        outer = r_tilde[:, :, None] * g[:, None, :]  # (E, coord_dim, embed_dim)
-        outer_flat = xp.reshape(
-            outer, (n_edge, self.coord_dim * self.embed_dim)
-        )  # (E, coord_dim*embed_dim)
-        # Source Freeze Propagation Gate: mute the outer-product contribution
-        # of any edge whose source node has a neighbor in the frozen zone.
-        src_gate = edge_cache.edge_src_gate
-        if src_gate is not None:
-            outer_flat = outer_flat * xp.astype(
-                xp.reshape(src_gate, (n_edge, 1)), outer_flat.dtype
-            )
-        # Destination scatter-add over ``dst`` (pt ``index_add_``), applied after
-        # the validity masking below. Layout-agnostic: correct for the padded
-        # ``call`` (row-major ``dst`` keeps the accumulation order identical to a
-        # sum over the ``nnei`` axis, hence bit-exact) and for the graph-native
-        # ``call_graph`` route (arbitrary ``dst`` order and per-node degree).
-        edge_mask = edge_cache.edge_mask
-        if edge_mask is not None:
-            outer_flat = outer_flat * xp.astype(
-                xp.reshape(edge_mask, (n_edge, 1)), outer_flat.dtype
-            )
-        env_agg = xp_add_at(
-            xp.zeros(
-                (n_nodes, self.coord_dim * self.embed_dim),
-                dtype=outer_flat.dtype,
-                device=array_api_compat.device(outer_flat),
-            ),
-            dst,
-            outer_flat,
-        )  # (N, coord_dim*embed_dim)
-        env_agg = xp.reshape(
-            env_agg, (n_nodes, self.coord_dim, self.embed_dim)
+        # === Step 3. Aggregate the edge outer products by destination ===
+        env_agg = self._aggregate_environment(
+            r_tilde, g, edge_cache, n_nodes
         )  # (N, coord_dim, embed_dim)
-
-        # === Step 4. Smooth normalization by envelope-squared degree ===
-        # Reuse the cache's inverse-sqrt degree so the version-aware
-        # ``deg_norm_floor`` is applied consistently with GIE.
-        env_agg = env_agg * xp.astype(edge_cache.inv_sqrt_deg, env_agg.dtype)
 
         # === Step 5. D matrix construction: D = env_agg^T @ env_agg[:,:,:axis_dim] ===
         # Summing over the coordinate axis makes D invariant to a joint rotation
@@ -794,6 +758,40 @@ class EnvironmentInitialEmbedding(NativeOP):
             D, (n_nodes, self.embed_dim * self.axis_dim)
         )  # (N, embed_dim*axis_dim)
         return self.output_proj(D_flat)
+
+    def _aggregate_environment(
+        self,
+        r_tilde: Any,
+        features: Any,
+        edge_cache: EdgeCache,
+        n_nodes: int,
+    ) -> Any:
+        """Scatter edge outer products and apply smooth degree normalization."""
+        xp = array_api_compat.array_namespace(r_tilde, features)
+        n_edge = edge_cache.dst.shape[0]
+        outer = r_tilde[:, :, None] * features[:, None, :]
+        outer_flat = xp.reshape(outer, (n_edge, self.coord_dim * self.embed_dim))
+        src_gate = edge_cache.edge_src_gate
+        if src_gate is not None:
+            outer_flat = outer_flat * xp.astype(
+                xp.reshape(src_gate, (n_edge, 1)), outer_flat.dtype
+            )
+        edge_mask = edge_cache.edge_mask
+        if edge_mask is not None:
+            outer_flat = outer_flat * xp.astype(
+                xp.reshape(edge_mask, (n_edge, 1)), outer_flat.dtype
+            )
+        env_agg = xp_add_at(
+            xp.zeros(
+                (n_nodes, self.coord_dim * self.embed_dim),
+                dtype=outer_flat.dtype,
+                device=array_api_compat.device(outer_flat),
+            ),
+            edge_cache.dst,
+            outer_flat,
+        )
+        env_agg = xp.reshape(env_agg, (n_nodes, self.coord_dim, self.embed_dim))
+        return env_agg * xp.astype(edge_cache.inv_sqrt_deg, env_agg.dtype)
 
     def _variables(self) -> dict[str, np.ndarray]:
         """Variables keyed by the pt ``state_dict`` key names."""
