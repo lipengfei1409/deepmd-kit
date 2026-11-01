@@ -43,6 +43,51 @@ class EnvironmentInitialEmbedding(EnvironmentInitialEmbeddingDP):
         self._tilelang_scatter_enabled = tilelang_operator_enabled(
             "DP_TILELANG_ENV_SEED_SCATTER"
         )
+        self._tilelang_matrix_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_ENV_SEED_MATRIX"
+        )
+        self._tilelang_gram_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_ENV_SEED_GRAM"
+        )
+
+    def _build_r_tilde(
+        self, edge_vec: torch.Tensor, edge_env: torch.Tensor
+    ) -> torch.Tensor:
+        if not self._tilelang_matrix_enabled:
+            return super()._build_r_tilde(edge_vec, edge_env)
+        if self.training:
+            raise RuntimeError("DP_TILELANG_ENV_SEED_MATRIX is inference-only")
+        if (
+            edge_vec.dtype != torch.float32
+            or edge_env.dtype != torch.float32
+            or not edge_vec.is_cuda
+            or torch.version.hip is None
+        ):
+            raise RuntimeError(
+                "TileLang environment matrix requires float32 HIP/DCU tensors"
+            )
+        from kernels.tilelang_ops import tilelang_environment_matrix
+
+        return tilelang_environment_matrix(edge_vec, edge_env, self.eps)
+
+    def _environment_gram(self, env_agg: torch.Tensor) -> torch.Tensor:
+        if not self._tilelang_gram_enabled:
+            return super()._environment_gram(env_agg)
+        if self.training:
+            raise RuntimeError("DP_TILELANG_ENV_SEED_GRAM is inference-only")
+        if self.spin_flags is not None:
+            raise RuntimeError("TileLang environment Gram does not support spin")
+        if (
+            env_agg.dtype != torch.float32
+            or not env_agg.is_cuda
+            or torch.version.hip is None
+        ):
+            raise RuntimeError(
+                "TileLang environment Gram requires float32 HIP/DCU tensors"
+            )
+        from kernels.tilelang_ops import tilelang_environment_seed_gram
+
+        return tilelang_environment_seed_gram(env_agg, self.axis_dim)
 
     def _aggregate_environment(
         self,

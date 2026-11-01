@@ -673,12 +673,7 @@ class EnvironmentInitialEmbedding(NativeOP):
         n_edge = dst.shape[0]
 
         # === Step 1. Construct r_tilde = [s, s*r_hat] ===
-        # s = edge_env * (1/r), r_hat = edge_vec / r
-        r_sq = xp.sum(edge_vec * edge_vec, axis=-1, keepdims=True)  # (E, 1)
-        inv_r = 1.0 / xp.sqrt(r_sq + self.eps * self.eps)  # (E, 1)
-        s = edge_env * inv_r  # (E, 1)
-        r_hat = edge_vec * inv_r  # (E, 3)
-        r_tilde = xp.concat([s, s * r_hat], axis=-1)  # (E, 4)
+        r_tilde = self._build_r_tilde(edge_vec, edge_env)  # (E, 4)
 
         # === Step 1b. Append neighbor spin as extra coordinate channels ===
         # The source (neighbor) spin enters the environment matrix gated by the
@@ -733,9 +728,7 @@ class EnvironmentInitialEmbedding(NativeOP):
         # of the geometry and the spin channels; with the spin channels present,
         # D additionally carries the neighbor spin-spin invariants.
         if self.spin_flags is None:
-            env_agg_t = xp.permute_dims(env_agg, (0, 2, 1))
-            env_agg_axis = env_agg[:, :, : self.axis_dim]
-            D = xp.matmul(env_agg_t, env_agg_axis)
+            D = self._environment_gram(env_agg)
         else:
             geometry_agg = env_agg[:, : self.geometry_coord_dim, :]
             spin_agg = env_agg[:, self.geometry_coord_dim :, :]
@@ -758,6 +751,22 @@ class EnvironmentInitialEmbedding(NativeOP):
             D, (n_nodes, self.embed_dim * self.axis_dim)
         )  # (N, embed_dim*axis_dim)
         return self.output_proj(D_flat)
+
+    def _build_r_tilde(self, edge_vec: Any, edge_env: Any) -> Any:
+        """Build the scalar and vector environment-matrix channels."""
+        xp = array_api_compat.array_namespace(edge_vec, edge_env)
+        r_sq = xp.sum(edge_vec * edge_vec, axis=-1, keepdims=True)
+        inv_r = 1.0 / xp.sqrt(r_sq + self.eps * self.eps)
+        scale = edge_env * inv_r
+        r_hat = edge_vec * inv_r
+        return xp.concat([scale, scale * r_hat], axis=-1)
+
+    def _environment_gram(self, env_agg: Any) -> Any:
+        """Form the invariant environment Gram matrix used by FiLM."""
+        xp = array_api_compat.array_namespace(env_agg)
+        env_agg_t = xp.permute_dims(env_agg, (0, 2, 1))
+        env_agg_axis = env_agg[:, :, : self.axis_dim]
+        return xp.matmul(env_agg_t, env_agg_axis)
 
     def _aggregate_environment(
         self,

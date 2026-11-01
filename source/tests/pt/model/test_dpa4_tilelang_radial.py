@@ -495,3 +495,46 @@ def test_enabled_edge_quaternion_does_not_fall_back_on_cpu(monkeypatch):
     edge_len = torch.ones((2, 1), dtype=torch.float32)
     with pytest.raises(RuntimeError, match="HIP/DCU"):
         descriptor._tilelang_edge_quaternion_fn(edge_vec, edge_len, 1.0e-7)
+
+
+def _make_env_seed_embedding():
+    return EnvironmentInitialEmbeddingPT(
+        ntypes=2,
+        n_radial=4,
+        channels=4,
+        embed_dim=8,
+        axis_dim=4,
+        type_dim=2,
+        hidden_dim=8,
+        precision="float32",
+        seed=7,
+        trainable=True,
+    )
+
+
+def test_enabled_env_seed_matrix_rejects_training_mode(monkeypatch):
+    monkeypatch.setenv("DP_TILELANG_ENV_SEED_MATRIX", "1")
+    embedding = _make_env_seed_embedding()
+    with pytest.raises(RuntimeError, match="inference-only"):
+        embedding._build_r_tilde(torch.ones((2, 3)), torch.ones((2, 1)))
+
+
+def test_enabled_env_seed_matrix_does_not_fall_back_on_cpu(monkeypatch):
+    monkeypatch.setenv("DP_TILELANG_ENV_SEED_MATRIX", "1")
+    embedding = _make_env_seed_embedding().eval()
+    with pytest.raises(RuntimeError, match="HIP/DCU"):
+        embedding._build_r_tilde(torch.ones((2, 3)), torch.ones((2, 1)))
+
+
+def test_enabled_env_seed_gram_rejects_training_mode(monkeypatch):
+    monkeypatch.setenv("DP_TILELANG_ENV_SEED_GRAM", "1")
+    embedding = _make_env_seed_embedding()
+    with pytest.raises(RuntimeError, match="inference-only"):
+        embedding._environment_gram(torch.ones((2, 4, 8)))
+
+
+def test_enabled_env_seed_gram_does_not_fall_back_on_cpu(monkeypatch):
+    monkeypatch.setenv("DP_TILELANG_ENV_SEED_GRAM", "1")
+    embedding = _make_env_seed_embedding().eval()
+    with pytest.raises(RuntimeError, match="HIP/DCU"):
+        embedding._environment_gram(torch.ones((2, 4, 8)))
