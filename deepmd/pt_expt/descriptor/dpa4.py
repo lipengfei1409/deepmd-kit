@@ -329,6 +329,22 @@ class DescrptDPA4(DescrptDPA4DP):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._tilelang_dpa4_enabled = tilelang_dpa4_enabled()
+        self._tilelang_edge_geometry_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_EDGE_GEOMETRY"
+        )
+        self._tilelang_edge_quaternion_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_EDGE_QUATERNION"
+        )
+        self._tilelang_edge_geometry_fn = (
+            self._run_tilelang_edge_geometry
+            if self._tilelang_edge_geometry_enabled
+            else None
+        )
+        self._tilelang_edge_quaternion_fn = (
+            self._run_tilelang_edge_quaternion
+            if self._tilelang_edge_quaternion_enabled
+            else None
+        )
         # The fused convolution paths consume only the three structural rows of
         # each Wigner degree block. Source-gated attention bypasses that fused
         # convolution, so its dense per-edge rotations remain available.
@@ -549,6 +565,40 @@ class DescrptDPA4(DescrptDPA4DP):
 
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
         self.version = float(self.version_tensor.item())
+
+    def _run_tilelang_edge_geometry(
+        self, edge_vec: torch.Tensor, eps: float
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.training:
+            raise RuntimeError("DP_TILELANG_EDGE_GEOMETRY is inference-only")
+        if (
+            edge_vec.dtype != torch.float32
+            or not edge_vec.is_cuda
+            or torch.version.hip is None
+        ):
+            raise RuntimeError(
+                "TileLang edge geometry requires float32 HIP/DCU tensors"
+            )
+        from kernels.tilelang_ops import tilelang_edge_geometry
+
+        return tilelang_edge_geometry(edge_vec, eps)
+
+    def _run_tilelang_edge_quaternion(
+        self, edge_vec: torch.Tensor, _edge_len: torch.Tensor, eps: float
+    ) -> torch.Tensor:
+        if self.training:
+            raise RuntimeError("DP_TILELANG_EDGE_QUATERNION is inference-only")
+        if (
+            edge_vec.dtype != torch.float32
+            or not edge_vec.is_cuda
+            or torch.version.hip is None
+        ):
+            raise RuntimeError(
+                "TileLang edge quaternion requires float32 HIP/DCU tensors"
+            )
+        from kernels.tilelang_ops import tilelang_edge_quaternion
+
+        return tilelang_edge_quaternion(edge_vec, eps, edge_len=_edge_len)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         if self._tilelang_dpa4_enabled:

@@ -12,6 +12,7 @@ from deepmd.dpmodel.descriptor.dpa4_nn.wignerd import (
 from deepmd.pt_expt.descriptor.dpa4 import (
     C3CutoffEnvelope as C3CutoffEnvelopePT,
 )
+from deepmd.pt_expt.descriptor.dpa4 import DescrptDPA4 as DescrptDPA4PT
 from deepmd.pt_expt.descriptor.dpa4 import (
     GridProduct as GridProductPT,
 )
@@ -436,3 +437,61 @@ def test_enabled_grid_product_does_not_fall_back_on_cpu(monkeypatch):
             to_grid=identity,
             from_grid=identity,
         )
+
+
+def _make_small_dpa4_descriptor():
+    return DescrptDPA4PT(
+        ntypes=2,
+        sel=[4],
+        channels=4,
+        n_radial=2,
+        radial_mlp=[4],
+        lmax=1,
+        mmax=1,
+        n_blocks=1,
+        mixing_layers=0,
+        n_atten_head=1,
+        radial_so2_mode="none",
+        precision="float32",
+        use_amp=False,
+    )
+
+
+def test_edge_geometry_switch_keeps_default_dispatch(monkeypatch):
+    monkeypatch.delenv("DP_TILELANG_EDGE_GEOMETRY", raising=False)
+    descriptor = _make_small_dpa4_descriptor()
+    assert descriptor._tilelang_edge_geometry_fn is None
+
+
+def test_enabled_edge_geometry_rejects_training_mode(monkeypatch):
+    monkeypatch.setenv("DP_TILELANG_EDGE_GEOMETRY", "1")
+    descriptor = _make_small_dpa4_descriptor()
+    edge_vec = torch.ones((2, 3), dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="inference-only"):
+        descriptor._tilelang_edge_geometry_fn(edge_vec, 1.0e-7)
+
+
+def test_enabled_edge_geometry_does_not_fall_back_on_cpu(monkeypatch):
+    monkeypatch.setenv("DP_TILELANG_EDGE_GEOMETRY", "1")
+    descriptor = _make_small_dpa4_descriptor().eval()
+    edge_vec = torch.ones((2, 3), dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="HIP/DCU"):
+        descriptor._tilelang_edge_geometry_fn(edge_vec, 1.0e-7)
+
+
+def test_enabled_edge_quaternion_rejects_training_mode(monkeypatch):
+    monkeypatch.setenv("DP_TILELANG_EDGE_QUATERNION", "1")
+    descriptor = _make_small_dpa4_descriptor()
+    edge_vec = torch.ones((2, 3), dtype=torch.float32)
+    edge_len = torch.ones((2, 1), dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="inference-only"):
+        descriptor._tilelang_edge_quaternion_fn(edge_vec, edge_len, 1.0e-7)
+
+
+def test_enabled_edge_quaternion_does_not_fall_back_on_cpu(monkeypatch):
+    monkeypatch.setenv("DP_TILELANG_EDGE_QUATERNION", "1")
+    descriptor = _make_small_dpa4_descriptor().eval()
+    edge_vec = torch.ones((2, 3), dtype=torch.float32)
+    edge_len = torch.ones((2, 1), dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="HIP/DCU"):
+        descriptor._tilelang_edge_quaternion_fn(edge_vec, edge_len, 1.0e-7)

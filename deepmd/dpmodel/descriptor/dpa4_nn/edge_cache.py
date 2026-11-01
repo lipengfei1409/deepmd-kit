@@ -47,6 +47,8 @@ WignerCalculatorFn = Callable[[Any], "tuple[Any, Any]"]
 # Distance and keep weight to the keep-weighted envelope and radial basis, the
 # fused replacement of applying the two modules separately.
 FusedRadialFn = Callable[[Any, Any], "tuple[Any, Any]"]
+EdgeGeometryFn = Callable[[Any, float], "tuple[Any, Any]"]
+EdgeQuaternionFn = Callable[[Any, Any, float], Any]
 
 
 @dataclass
@@ -279,6 +281,8 @@ def _edge_cache_from_arrays(
     node_partial_exchange: Callable[[Any], Any] | None = None,
     fused_radial: FusedRadialFn | None = None,
     fused_wigner: WignerCalculatorFn | None = None,
+    edge_geometry_fn: EdgeGeometryFn | None = None,
+    edge_quaternion_fn: EdgeQuaternionFn | None = None,
 ) -> EdgeCache:
     """
     Build the global edge cache from a sparse edge list.
@@ -366,7 +370,10 @@ def _edge_cache_from_arrays(
     edge_vec = edge_vec + xp.concat([zeros2, 1.0 - edge_keep_f], axis=-1)
 
     # === Step 3. Edge length, envelope, and radial basis ===
-    edge_len = safe_norm(edge_vec, eps)
+    if edge_geometry_fn is None:
+        edge_len = safe_norm(edge_vec, eps)
+    else:
+        edge_len, _ = edge_geometry_fn(edge_vec, eps)
     if inner_clamp is not None:
         clamped = inner_clamp(edge_len)
         scale = clamped / edge_len
@@ -387,6 +394,7 @@ def _edge_cache_from_arrays(
         wigner_calc=fused_wigner if fused_wigner is not None else wigner_calc,
         gamma=gamma,
         build_full=build_wigner,
+        edge_quaternion_fn=edge_quaternion_fn,
     )  # (E, D, D), (E, D, D), (E, 4)
 
     # === Step 5. Edge type features ===
@@ -434,6 +442,7 @@ def _build_edge_wigner(
     wigner_calc: WignerCalculatorFn,
     gamma: Any = None,
     build_full: bool = True,
+    edge_quaternion_fn: EdgeQuaternionFn | None = None,
 ) -> tuple[Any, Any, Any]:
     """
     Build packed Wigner-D blocks from edge vectors.
@@ -472,11 +481,14 @@ def _build_edge_wigner(
     xp = array_api_compat.array_namespace(edge_vec)
     device = array_api_compat.device(edge_vec)
     # === Step 1. Build edge-aligned quaternions ===
-    edge_quat = build_edge_quaternion(
-        edge_vec,
-        edge_len=edge_len,
-        eps=eps,
-    )
+    if edge_quaternion_fn is None:
+        edge_quat = build_edge_quaternion(
+            edge_vec,
+            edge_len=edge_len,
+            eps=eps,
+        )
+    else:
+        edge_quat = edge_quaternion_fn(edge_vec, edge_len, eps)
 
     # === Step 2. Apply optional random local-Z roll ===
     # Training-only augmentation: drawn with the backend's own RNG so torch
