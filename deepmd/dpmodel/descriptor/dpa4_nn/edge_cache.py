@@ -49,6 +49,7 @@ WignerCalculatorFn = Callable[[Any], "tuple[Any, Any]"]
 FusedRadialFn = Callable[[Any, Any], "tuple[Any, Any]"]
 EdgeGeometryFn = Callable[[Any, float], "tuple[Any, Any]"]
 EdgeQuaternionFn = Callable[[Any, Any, float], Any]
+EdgeTypeFeatureFn = Callable[[Any, Any, Any, Any], Any]
 
 
 @dataclass
@@ -283,6 +284,7 @@ def _edge_cache_from_arrays(
     fused_wigner: WignerCalculatorFn | None = None,
     edge_geometry_fn: EdgeGeometryFn | None = None,
     edge_quaternion_fn: EdgeQuaternionFn | None = None,
+    edge_type_feature_fn: EdgeTypeFeatureFn | None = None,
 ) -> EdgeCache:
     """
     Build the global edge cache from a sparse edge list.
@@ -398,8 +400,11 @@ def _edge_cache_from_arrays(
     )  # (E, D, D), (E, D, D), (E, 4)
 
     # === Step 5. Edge type features ===
-    edge_type_feat = build_edge_type_feat(type_ebed, src, dst)
-    edge_type_feat = edge_type_feat * xp.astype(edge_keep_f, edge_type_feat.dtype)
+    if edge_type_feature_fn is None:
+        edge_type_feat = build_edge_type_feat(type_ebed, src, dst)
+        edge_type_feat = edge_type_feat * xp.astype(edge_keep_f, edge_type_feat.dtype)
+    else:
+        edge_type_feat = edge_type_feature_fn(type_ebed, src, dst, edge_keep_f)
 
     # === Step 6. Source Freeze Propagation Gate (optional) ===
     # The sparse-edge path packs masked dummy edges so the compiled graph sees

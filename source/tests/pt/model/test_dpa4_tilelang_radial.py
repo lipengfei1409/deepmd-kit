@@ -538,3 +538,31 @@ def test_enabled_env_seed_gram_does_not_fall_back_on_cpu(monkeypatch):
     embedding = _make_env_seed_embedding().eval()
     with pytest.raises(RuntimeError, match="HIP/DCU"):
         embedding._environment_gram(torch.ones((2, 4, 8)))
+
+
+def test_edge_type_feature_switch_keeps_default_dispatch(monkeypatch):
+    monkeypatch.delenv("DP_TILELANG_EDGE_TYPE_FEATURES", raising=False)
+    descriptor = _make_small_dpa4_descriptor()
+    assert descriptor._tilelang_edge_type_feature_fn is None
+
+
+def test_enabled_edge_type_features_rejects_training_mode(monkeypatch):
+    monkeypatch.setenv("DP_TILELANG_EDGE_TYPE_FEATURES", "1")
+    descriptor = _make_small_dpa4_descriptor()
+    features = torch.ones((3, 4), dtype=torch.float32)
+    src = torch.tensor([0, 1], dtype=torch.int64)
+    dst = torch.tensor([1, 2], dtype=torch.int64)
+    keep = torch.ones((2, 1), dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="inference-only"):
+        descriptor._tilelang_edge_type_feature_fn(features, src, dst, keep)
+
+
+def test_enabled_edge_type_features_does_not_fall_back_on_cpu(monkeypatch):
+    monkeypatch.setenv("DP_TILELANG_EDGE_TYPE_FEATURES", "1")
+    descriptor = _make_small_dpa4_descriptor().eval()
+    features = torch.ones((3, 4), dtype=torch.float32)
+    src = torch.tensor([0, 1], dtype=torch.int64)
+    dst = torch.tensor([1, 2], dtype=torch.int64)
+    keep = torch.ones((2, 1), dtype=torch.float32)
+    with pytest.raises(RuntimeError, match="HIP/DCU"):
+        descriptor._tilelang_edge_type_feature_fn(features, src, dst, keep)
