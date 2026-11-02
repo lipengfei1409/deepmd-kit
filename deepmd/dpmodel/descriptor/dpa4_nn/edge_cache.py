@@ -50,6 +50,7 @@ FusedRadialFn = Callable[[Any, Any], "tuple[Any, Any]"]
 EdgeGeometryFn = Callable[[Any, float], "tuple[Any, Any]"]
 EdgeQuaternionFn = Callable[[Any, Any, float], Any]
 EdgeTypeFeatureFn = Callable[[Any, Any, Any, Any], Any]
+EdgeDegreeFn = Callable[[Any, Any, int, float], "tuple[Any, Any]"]
 
 
 @dataclass
@@ -285,6 +286,7 @@ def _edge_cache_from_arrays(
     edge_geometry_fn: EdgeGeometryFn | None = None,
     edge_quaternion_fn: EdgeQuaternionFn | None = None,
     edge_type_feature_fn: EdgeTypeFeatureFn | None = None,
+    edge_degree_fn: EdgeDegreeFn | None = None,
 ) -> EdgeCache:
     """
     Build the global edge cache from a sparse edge list.
@@ -422,6 +424,12 @@ def _edge_cache_from_arrays(
             node_partial_exchange=node_partial_exchange,
         )
 
+    degree_data = (
+        None
+        if edge_degree_fn is None
+        else edge_degree_fn(edge_env, dst, n_nodes, deg_norm_floor)
+    )
+
     return _finalize_edge_cache(
         n_nodes=n_nodes,
         src=src,
@@ -435,6 +443,7 @@ def _edge_cache_from_arrays(
         edge_quat=edge_quat,
         deg_norm_floor=deg_norm_floor,
         edge_src_gate=edge_src_gate,
+        degree_data=degree_data,
     )
 
 
@@ -527,6 +536,7 @@ def _finalize_edge_cache(
     edge_quat: Any,
     deg_norm_floor: float,
     edge_src_gate: Any = None,
+    degree_data: tuple[Any, Any] | None = None,
 ) -> EdgeCache:
     """
     Assemble the shared `EdgeCache` layout.
@@ -573,12 +583,15 @@ def _finalize_edge_cache(
     xp = array_api_compat.array_namespace(edge_vec, dst)
     device = array_api_compat.device(edge_vec)
     # === Step 1. Build smooth destination degrees ===
-    deg = xp.zeros((n_nodes,), dtype=edge_vec.dtype, device=device)  # (N,)
-    env_flat = xp.astype(edge_env[..., 0], edge_vec.dtype)
-    deg = xp_add_at(deg, dst, env_flat * env_flat)
-    inv_sqrt_deg = xp.reshape(
-        1.0 / xp.sqrt(deg + deg_norm_floor), (n_nodes, 1, 1)
-    )  # (N, 1, 1)
+    if degree_data is None:
+        deg = xp.zeros((n_nodes,), dtype=edge_vec.dtype, device=device)  # (N,)
+        env_flat = xp.astype(edge_env[..., 0], edge_vec.dtype)
+        deg = xp_add_at(deg, dst, env_flat * env_flat)
+        inv_sqrt_deg = xp.reshape(
+            1.0 / xp.sqrt(deg + deg_norm_floor), (n_nodes, 1, 1)
+        )  # (N, 1, 1)
+    else:
+        deg, inv_sqrt_deg = degree_data
 
     return EdgeCache(
         src=src,

@@ -353,6 +353,14 @@ class DescrptDPA4(DescrptDPA4DP):
             if self._tilelang_edge_type_features_enabled
             else None
         )
+        self._tilelang_edge_degree_enabled = tilelang_operator_enabled(
+            "DP_TILELANG_EDGE_DEGREE"
+        )
+        self._tilelang_edge_degree_fn = (
+            self._run_tilelang_edge_degree
+            if self._tilelang_edge_degree_enabled
+            else None
+        )
         # The fused convolution paths consume only the three structural rows of
         # each Wigner degree block. Source-gated attention bypasses that fused
         # convolution, so its dense per-edge rotations remain available.
@@ -629,6 +637,25 @@ class DescrptDPA4(DescrptDPA4DP):
         from kernels.tilelang_ops import tilelang_edge_type_features
 
         return tilelang_edge_type_features(node_features, src, dst, edge_keep)
+
+    def _run_tilelang_edge_degree(
+        self,
+        edge_env: torch.Tensor,
+        dst: torch.Tensor,
+        n_nodes: int,
+        deg_norm_floor: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.training:
+            raise RuntimeError("DP_TILELANG_EDGE_DEGREE is inference-only")
+        if (
+            edge_env.dtype != torch.float32
+            or not edge_env.is_cuda
+            or torch.version.hip is None
+        ):
+            raise RuntimeError("TileLang edge degree requires float32 HIP/DCU tensors")
+        from kernels.tilelang_ops import tilelang_edge_degree
+
+        return tilelang_edge_degree(edge_env, dst, n_nodes, deg_norm_floor)
 
     def forward(self, *args: Any, **kwargs: Any) -> Any:
         if self._tilelang_dpa4_enabled:

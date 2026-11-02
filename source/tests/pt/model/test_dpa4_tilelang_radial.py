@@ -566,3 +566,21 @@ def test_enabled_edge_type_features_does_not_fall_back_on_cpu(monkeypatch):
     keep = torch.ones((2, 1), dtype=torch.float32)
     with pytest.raises(RuntimeError, match="HIP/DCU"):
         descriptor._tilelang_edge_type_feature_fn(features, src, dst, keep)
+
+
+def test_enabled_edge_degree_rejects_training_mode(monkeypatch):
+    monkeypatch.setenv("DP_TILELANG_EDGE_DEGREE", "1")
+    descriptor = _make_small_dpa4_descriptor()
+    edge_env = torch.ones((2, 1), dtype=torch.float32)
+    dst = torch.tensor([0, 1], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="inference-only"):
+        descriptor._tilelang_edge_degree_fn(edge_env, dst, 2, 0.25)
+
+
+def test_enabled_edge_degree_does_not_fall_back_on_cpu(monkeypatch):
+    monkeypatch.setenv("DP_TILELANG_EDGE_DEGREE", "1")
+    descriptor = _make_small_dpa4_descriptor().eval()
+    edge_env = torch.ones((2, 1), dtype=torch.float32)
+    dst = torch.tensor([0, 1], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="HIP/DCU"):
+        descriptor._tilelang_edge_degree_fn(edge_env, dst, 2, 0.25)

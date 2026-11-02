@@ -1601,6 +1601,7 @@ class DescrptDPA4(NativeOP, BaseDescriptor):
             edge_geometry_fn=getattr(self, "_tilelang_edge_geometry_fn", None),
             edge_quaternion_fn=getattr(self, "_tilelang_edge_quaternion_fn", None),
             edge_type_feature_fn=getattr(self, "_tilelang_edge_type_feature_fn", None),
+            edge_degree_fn=getattr(self, "_tilelang_edge_degree_fn", None),
             # Random local-Z roll is a training-only augmentation; the model
             # is roll-equivariant, so inference fixes gamma.
             random_gamma=self.random_gamma and training,
