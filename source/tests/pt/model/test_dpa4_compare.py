@@ -340,13 +340,13 @@ def test_compare_water_dpa4_pt_expt_vs_tilelang(tmp_path: Path) -> None:
     force_metrics = _error_metrics(
         baseline_outputs["force"], tilelang_outputs["force"]
     )
-    torch.testing.assert_close(
+    energy_within_tolerance = torch.allclose(
         tilelang_outputs["energy"],
         baseline_outputs["energy"],
         rtol=rtol,
         atol=atol,
     )
-    torch.testing.assert_close(
+    force_within_tolerance = torch.allclose(
         tilelang_outputs["force"],
         baseline_outputs["force"],
         rtol=rtol,
@@ -375,6 +375,10 @@ def test_compare_water_dpa4_pt_expt_vs_tilelang(tmp_path: Path) -> None:
         "numerical_agreement": {
             "energy": energy_metrics,
             "force": force_metrics,
+            "within_tolerance": {
+                "energy": energy_within_tolerance,
+                "force": force_within_tolerance,
+            },
             "note": (
                 "Agreement against the DeepMD-kit path on this fixture; "
                 "not labeled scientific accuracy."
@@ -404,4 +408,16 @@ def test_compare_water_dpa4_pt_expt_vs_tilelang(tmp_path: Path) -> None:
             tilelang_latency["median_ms"],
             speedup,
         )
+    )
+    torch.testing.assert_close(
+        tilelang_outputs["energy"],
+        baseline_outputs["energy"],
+        rtol=rtol,
+        atol=atol,
+    )
+    torch.testing.assert_close(
+        tilelang_outputs["force"],
+        baseline_outputs["force"],
+        rtol=rtol,
+        atol=atol,
     )
