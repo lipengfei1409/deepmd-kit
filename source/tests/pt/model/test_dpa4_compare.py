@@ -145,8 +145,7 @@ def _require_comparison_runtime() -> None:
     except ModuleNotFoundError as error:
         if error.name in {"deepmd", "deepmd.lib"}:
             pytest.skip(
-                "compiled DeepMD-kit runtime deepmd.lib is unavailable: "
-                f"{error}"
+                f"compiled DeepMD-kit runtime deepmd.lib is unavailable: {error}"
             )
         raise
 
@@ -338,9 +337,7 @@ def test_compare_water_dpa4_pt_expt_vs_tilelang(tmp_path: Path) -> None:
     energy_metrics = _error_metrics(
         baseline_outputs["energy"], tilelang_outputs["energy"]
     )
-    force_metrics = _error_metrics(
-        baseline_outputs["force"], tilelang_outputs["force"]
-    )
+    force_metrics = _error_metrics(baseline_outputs["force"], tilelang_outputs["force"])
     energy_within_tolerance = torch.allclose(
         tilelang_outputs["energy"],
         baseline_outputs["energy"],
