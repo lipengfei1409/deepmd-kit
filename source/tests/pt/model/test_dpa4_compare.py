@@ -25,6 +25,7 @@ import json
 import math
 import os
 import statistics
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -394,21 +395,22 @@ def test_compare_water_dpa4_pt_expt_vs_tilelang(tmp_path: Path) -> None:
     report_path = output_dir / "dpa4_comparison.json"
     report_path.write_text(json.dumps(report, indent=2) + "\n")
 
-    print(f"DPA4 comparison report: {report_path}")
-    print(
-        "Energy max_abs={:.6e}, force max_abs={:.6e}, force relative_l2={:.6e}".format(
+    sys.stdout.write(f"DPA4 comparison report: {report_path}\n")
+    sys.stdout.write(
+        "Energy max_abs={:.6e}, force max_abs={:.6e}, force relative_l2={:.6e}\n".format(
             energy_metrics["max_abs"],
             force_metrics["max_abs"],
             force_metrics["relative_l2"],
         )
     )
-    print(
-        "Latency p50: DeepMD-kit={:.3f} ms, TileLang={:.3f} ms, speedup={:.3f}x".format(
+    sys.stdout.write(
+        "Latency p50: DeepMD-kit={:.3f} ms, TileLang={:.3f} ms, speedup={:.3f}x\n".format(
             baseline_latency["median_ms"],
             tilelang_latency["median_ms"],
             speedup,
         )
     )
+    sys.stdout.flush()
     torch.testing.assert_close(
         tilelang_outputs["energy"],
         baseline_outputs["energy"],
