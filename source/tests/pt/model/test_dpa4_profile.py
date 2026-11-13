@@ -375,7 +375,6 @@ def test_profile_water_dpa4_energy_force(tmp_path: Path) -> None:
         "dtype": str(coordinates.dtype),
         "warmup_steps": warmup_steps,
         "profile_steps": profile_steps,
-        "tilelang_dpa4_enabled": os.environ.get("DP_TILELANG_DPA4", "0"),
         "trace_file": str(trace_path),
         "stage_sort_metric": stage_sort_field,
         "operator_sort_metric": operator_sort_field,

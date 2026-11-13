@@ -47,10 +47,6 @@ WignerCalculatorFn = Callable[[Any], "tuple[Any, Any]"]
 # Distance and keep weight to the keep-weighted envelope and radial basis, the
 # fused replacement of applying the two modules separately.
 FusedRadialFn = Callable[[Any, Any], "tuple[Any, Any]"]
-EdgeGeometryFn = Callable[[Any, float], "tuple[Any, Any]"]
-EdgeQuaternionFn = Callable[[Any, Any, float], Any]
-EdgeTypeFeatureFn = Callable[[Any, Any, Any, Any], Any]
-EdgeDegreeFn = Callable[[Any, Any, int, float], "tuple[Any, Any]"]
 
 
 @dataclass
@@ -283,10 +279,6 @@ def _edge_cache_from_arrays(
     node_partial_exchange: Callable[[Any], Any] | None = None,
     fused_radial: FusedRadialFn | None = None,
     fused_wigner: WignerCalculatorFn | None = None,
-    edge_geometry_fn: EdgeGeometryFn | None = None,
-    edge_quaternion_fn: EdgeQuaternionFn | None = None,
-    edge_type_feature_fn: EdgeTypeFeatureFn | None = None,
-    edge_degree_fn: EdgeDegreeFn | None = None,
 ) -> EdgeCache:
     """
     Build the global edge cache from a sparse edge list.
@@ -374,10 +366,7 @@ def _edge_cache_from_arrays(
     edge_vec = edge_vec + xp.concat([zeros2, 1.0 - edge_keep_f], axis=-1)
 
     # === Step 3. Edge length, envelope, and radial basis ===
-    if edge_geometry_fn is None:
-        edge_len = safe_norm(edge_vec, eps)
-    else:
-        edge_len, _ = edge_geometry_fn(edge_vec, eps)
+    edge_len = safe_norm(edge_vec, eps)
     if inner_clamp is not None:
         clamped = inner_clamp(edge_len)
         scale = clamped / edge_len
@@ -398,15 +387,11 @@ def _edge_cache_from_arrays(
         wigner_calc=fused_wigner if fused_wigner is not None else wigner_calc,
         gamma=gamma,
         build_full=build_wigner,
-        edge_quaternion_fn=edge_quaternion_fn,
     )  # (E, D, D), (E, D, D), (E, 4)
 
     # === Step 5. Edge type features ===
-    if edge_type_feature_fn is None:
-        edge_type_feat = build_edge_type_feat(type_ebed, src, dst)
-        edge_type_feat = edge_type_feat * xp.astype(edge_keep_f, edge_type_feat.dtype)
-    else:
-        edge_type_feat = edge_type_feature_fn(type_ebed, src, dst, edge_keep_f)
+    edge_type_feat = build_edge_type_feat(type_ebed, src, dst)
+    edge_type_feat = edge_type_feat * xp.astype(edge_keep_f, edge_type_feat.dtype)
 
     # === Step 6. Source Freeze Propagation Gate (optional) ===
     # The sparse-edge path packs masked dummy edges so the compiled graph sees
@@ -424,12 +409,6 @@ def _edge_cache_from_arrays(
             node_partial_exchange=node_partial_exchange,
         )
 
-    degree_data = (
-        None
-        if edge_degree_fn is None
-        else edge_degree_fn(edge_env, dst, n_nodes, deg_norm_floor)
-    )
-
     return _finalize_edge_cache(
         n_nodes=n_nodes,
         src=src,
@@ -443,7 +422,6 @@ def _edge_cache_from_arrays(
         edge_quat=edge_quat,
         deg_norm_floor=deg_norm_floor,
         edge_src_gate=edge_src_gate,
-        degree_data=degree_data,
     )
 
 
@@ -456,7 +434,6 @@ def _build_edge_wigner(
     wigner_calc: WignerCalculatorFn,
     gamma: Any = None,
     build_full: bool = True,
-    edge_quaternion_fn: EdgeQuaternionFn | None = None,
 ) -> tuple[Any, Any, Any]:
     """
     Build packed Wigner-D blocks from edge vectors.
@@ -495,14 +472,11 @@ def _build_edge_wigner(
     xp = array_api_compat.array_namespace(edge_vec)
     device = array_api_compat.device(edge_vec)
     # === Step 1. Build edge-aligned quaternions ===
-    if edge_quaternion_fn is None:
-        edge_quat = build_edge_quaternion(
-            edge_vec,
-            edge_len=edge_len,
-            eps=eps,
-        )
-    else:
-        edge_quat = edge_quaternion_fn(edge_vec, edge_len, eps)
+    edge_quat = build_edge_quaternion(
+        edge_vec,
+        edge_len=edge_len,
+        eps=eps,
+    )
 
     # === Step 2. Apply optional random local-Z roll ===
     # Training-only augmentation: drawn with the backend's own RNG so torch
