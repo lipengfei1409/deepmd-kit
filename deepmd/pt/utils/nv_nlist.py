@@ -86,6 +86,8 @@ def is_nv_available() -> bool:
     """Whether the ``nvalchemiops`` Toolkit-Ops neighbor list is importable."""
     # Warp's one-time CUDA probe prints to the native stderr on CPU-only hosts;
     # mute it there without hiding diagnostics on machines that have a GPU.
+    if torch.version.hip is not None:
+        return False
     import_ctx = (
         _suppress_native_stderr()
         if not torch.cuda.is_available()

@@ -78,7 +78,7 @@ def vesin_search_ijs(
     ss : (E, 3) int64 periodic image shifts.
     """
     import vesin.torch as _vesin_torch
-
+    device = 'cpu' if torch.version.hip is not None else device
     box = (
         cell if periodic else torch.zeros((3, 3), dtype=positions.dtype, device=device)
     )
