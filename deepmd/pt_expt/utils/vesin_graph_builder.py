@@ -78,19 +78,34 @@ def vesin_search_ijs(
     ss : (E, 3) int64 periodic image shifts.
     """
     import vesin.torch as _vesin_torch
-    device = 'cpu' if torch.version.hip is not None else device
-    box = (
-        cell if periodic else torch.zeros((3, 3), dtype=positions.dtype, device=device)
+
+    output_device = torch.device(device)
+    # PyTorch names HIP tensors "cuda", but vesin's GPU implementation loads
+    # NVIDIA libcuda. Search on CPU and return indices to the model device.
+    search_device = (
+        torch.device("cpu")
+        if torch.version.hip is not None and output_device.type == "cuda"
+        else output_device
+    )
+    search_positions = positions.detach().to(search_device)
+    search_box = (
+        cell.detach().to(search_device)
+        if periodic
+        else torch.zeros((3, 3), dtype=positions.dtype, device=search_device)
     )
     nl = _vesin_torch.NeighborList(cutoff=float(rcut), full_list=True)
-    with torch.device(device):
+    with torch.device(search_device):
         ii, jj, ss = nl.compute(
-            points=positions,
-            box=box,
+            points=search_positions,
+            box=search_box,
             periodic=periodic,
             quantities="ijS",
         )
-    return ii.to(torch.int64), jj.to(torch.int64), ss.to(torch.int64).reshape(-1, 3)
+    return (
+        ii.to(device=output_device, dtype=torch.int64),
+        jj.to(device=output_device, dtype=torch.int64),
+        ss.to(device=output_device, dtype=torch.int64).reshape(-1, 3),
+    )
 
 
 def build_neighbor_graph_vesin(
