@@ -16,6 +16,7 @@
 #include <type_traits>
 #include <unordered_map>
 
+#include "PTExptProfiler.h"
 #include "SimulationRegion.h"
 #include "common.h"
 #include "commonPT.h"
@@ -422,10 +423,17 @@ void DeepPotPTExpt::init(const std::string& model,
     }
   }
 
+  profiler_ = ptexpt::WindowProfiler::from_environment(
+      gpu_enabled, gpu_id, [this] {
+        if (gpu_enabled) {
+          const c10::DeviceGuard guard(torch::Device(torch::kCUDA, gpu_id));
+          synchronize_current_accelerator_stream();
+        }
+      });
   inited = true;
 }
 
-DeepPotPTExpt::~DeepPotPTExpt() {}
+DeepPotPTExpt::~DeepPotPTExpt() { profiler_.reset(); }
 
 void DeepPotPTExpt::set_charge_spin(const std::vector<double>& charge_spin) {
   assert(inited);
@@ -726,6 +734,7 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
                             const std::vector<VALUETYPE>& aparam,
                             const std::vector<double>& charge_spin,
                             const bool atomic) {
+  ptexpt::WindowProfiler::Scope profile_scope(profiler_.get());
   // Fail fast before allocating any tensors: refuse to run if the caller
   // asked for atomic virial but the .pt2 was exported without it.
   if (atomic && !do_atomic_virial) {
@@ -1441,6 +1450,7 @@ void DeepPotPTExpt::compute(ENERGYVTYPE& ener,
                             const std::vector<VALUETYPE>& aparam,
                             const std::vector<double>& charge_spin,
                             const bool atomic) {
+  ptexpt::WindowProfiler::Scope profile_scope(profiler_.get());
   // Fail fast before allocating any tensors (same check as the nlist
   // overload — see its comment).
   if (atomic && !do_atomic_virial) {
@@ -2200,6 +2210,7 @@ void DeepPotPTExpt::compute_edges_gpu_impl(double* d_atom_energy,
                                            const std::vector<double>& aparam,
                                            const int nall_nodes,
                                            const InputNlist* comm_nlist) {
+  ptexpt::WindowProfiler::Scope profile_scope(profiler_.get());
   if (lower_input_is_canonical_) {
     throw deepmd::deepmd_exception(
         "compute_edges_gpu cannot serve a compact canonical artifact; use "
@@ -2545,6 +2556,7 @@ void DeepPotPTExpt::compute_canonical_graph_gpu_impl(
     const int nloc,
     const int nall_nodes,
     const std::int64_t edge_storage) {
+  ptexpt::WindowProfiler::Scope profile_scope(profiler_.get());
   if (!lower_input_is_canonical_) {
     throw deepmd::deepmd_exception(
         "compute_canonical_graph_gpu requires a compact canonical artifact.");

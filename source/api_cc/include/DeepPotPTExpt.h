@@ -22,6 +22,7 @@
 namespace deepmd::ptexpt {
 class TempFile;
 class ChargeStateFold;
+class WindowProfiler;
 }  // namespace deepmd::ptexpt
 
 namespace torch::inductor {
@@ -442,6 +443,7 @@ class DeepPotPTExpt : public DeepPotBackend {
       const int nloc,
       const int nall_nodes,
       const std::int64_t edge_storage);
+  std::unique_ptr<ptexpt::WindowProfiler> profiler_;
   bool inited;
   // Every width below is a property of the loaded archive.  They read as zero
   // until ``init`` has run, so that a query on an uninitialised backend
