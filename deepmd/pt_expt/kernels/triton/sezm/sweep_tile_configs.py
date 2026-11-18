@@ -22,7 +22,8 @@ The module is used in three ways:
    (``--cf/--lmax``) or every key a checkpoint needs (``--model``), and
    prints the resulting entries as a Python fragment in the layout of
    :mod:`.tile_config_data`, ready to be merged under a new GPU name when
-   extending the built-in tables.
+   extending the built-in tables; :mod:`.merge_tile_configs` performs that
+   merge, validating and read-back checking the result.
 3. *Table regeneration* -- rerunning a sweep after any kernel-body change;
    see the mandatory-validation note below.
 
@@ -121,6 +122,7 @@ from __future__ import (
 import argparse
 import itertools
 import logging
+import os
 import statistics
 from contextlib import (
     contextmanager,
@@ -197,8 +199,151 @@ __all__ = [
 log = logging.getLogger(__name__)
 
 _BLOCK_M_CANDIDATES = (8, 16, 32, 64)
-_WARP_CANDIDATES = (4, 8, 16)
+_WARP_CANDIDATES_BASE = (4, 8, 16)
 _STAGE_CANDIDATES = (1, 2)
+
+# --- device-shaped candidate grids -------------------------------------------
+# The grids below were sized for 32-lane NVIDIA warps and a ~228 KB LDS budget.
+# A wave64 device (AMD/CDNA, i.e. every DCU) redefines `num_warps` (1 warp ==
+# 64 lanes), caps LDS at 64 KB and threads per block far lower, so the same
+# grid both misses the small-CTA optima and can pick a launch that cannot even
+# be compiled.  The helpers below adapt a grid to the running device; on a
+# 32-lane NVIDIA device every one of them is the identity.
+_AMD_EXTRA_WARPS = (1, 2)
+_LDS_GUARD_SLACK = 1.25
+_DEVICE_LIMITS: list[dict[str, Any] | None] = []
+
+
+def _device_limits() -> dict[str, Any] | None:
+    """Return wave size, block thread cap and LDS budget of the running device.
+
+    Returns ``None`` when no CUDA/HIP device is visible, in which case every
+    adaptation is skipped and the NVIDIA-shaped grid is used unchanged.
+    ``DP_TRITON_LDS_BYTES`` overrides the detected LDS budget, and
+    ``DP_TRITON_LDS_GUARD=0`` disables the budget filter entirely.  The result
+    is cached: the sweep asks once per candidate.
+    """
+    if _DEVICE_LIMITS:
+        return _DEVICE_LIMITS[0]
+    if not torch.cuda.is_available():
+        _DEVICE_LIMITS.append(None)
+        return None
+    properties = torch.cuda.get_device_properties(torch.cuda.current_device())
+    wave_size = int(getattr(properties, "warp_size", 32) or 32)
+    max_threads = int(getattr(properties, "max_threads_per_block", 1024) or 1024)
+    lds_bytes = 0
+    for name in (
+        "shared_memory_per_block_optin",
+        "shared_memory_per_block",
+        "shared_memory_per_multiprocessor",
+    ):
+        try:
+            lds_bytes = max(lds_bytes, int(getattr(properties, name, 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    override = os.environ.get("DP_TRITON_LDS_BYTES", "").strip()
+    if override:
+        lds_bytes = int(override)
+    limits = {
+        "wave_size": wave_size,
+        "max_threads": max_threads,
+        "lds_bytes": lds_bytes,
+    }
+    _DEVICE_LIMITS.append(limits)
+    return limits
+
+
+def _lds_guard_enabled() -> bool:
+    """Return whether candidates are filtered by the device LDS budget."""
+    raw = os.environ.get("DP_TRITON_LDS_GUARD", "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def _warp_candidates(base: tuple[int, ...] | None = None) -> tuple[int, ...]:
+    """Return the ``num_warps`` grid this device can actually run.
+
+    On a wave64 device the small-CTA candidates are added (``num_warps=1`` is a
+    64-lane CTA there) and every candidate above the threads-per-block cap is
+    dropped.  On a 32-lane device the caller's grid is returned untouched.
+    """
+    candidates = _WARP_CANDIDATES_BASE if base is None else base
+    limits = _device_limits()
+    if limits is None or limits["wave_size"] <= 32:
+        return candidates
+    expanded = tuple(sorted(set(candidates) | set(_AMD_EXTRA_WARPS)))
+    fitted = tuple(
+        warps
+        for warps in expanded
+        if warps * limits["wave_size"] <= limits["max_threads"]
+    )
+    return fitted or candidates
+
+
+def _gemm_lds_bytes(
+    block_m: int, block_n: int, block_k: int, stages: int, element_bytes: int = 4
+) -> int:
+    """Estimate the LDS a pipelined GEMM tile needs, in bytes.
+
+    Upper bound on the two input stages Triton double-buffers; the accumulator
+    lives in registers.  Used only to skip candidates that cannot fit, so the
+    bound deliberately errs high.
+    """
+    return (block_m * block_k + block_k * block_n) * element_bytes * stages
+
+
+def _fits_device(
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    warps: int,
+    stages: int,
+    *,
+    element_bytes: int = 4,
+) -> bool:
+    """Return whether a GEMM candidate can plausibly launch on this device."""
+    limits = _device_limits()
+    if limits is None:
+        return True
+    if warps * limits["wave_size"] > limits["max_threads"]:
+        return False
+    if not _lds_guard_enabled() or limits["lds_bytes"] <= 0:
+        return True
+    needed = _gemm_lds_bytes(block_m, block_n, block_k, stages, element_bytes)
+    return needed * _LDS_GUARD_SLACK <= limits["lds_bytes"]
+
+
+def _launchable_gemm_candidates(
+    candidates: tuple[GemmConfig, ...], *, element_bytes: int = 4
+) -> tuple[GemmConfig, ...]:
+    """Drop the GEMM candidates this device cannot launch, and report them."""
+    kept = tuple(
+        config
+        for config in candidates
+        if _fits_device(*config[:5], element_bytes=element_bytes)
+    )
+    if len(kept) != len(candidates):
+        print(
+            f"  [{len(candidates) - len(kept)} of {len(candidates)} GEMM candidates "
+            "skipped: they exceed this device's thread or LDS budget]"
+        )
+    return kept or candidates
+
+
+def _describe_sweep_device() -> None:
+    """Print the tuning-relevant limits of the device the sweep runs on."""
+    limits = _device_limits()
+    if limits is None:
+        print("sweep device: no CUDA/HIP device visible")
+        return
+    name = torch.cuda.get_device_name(torch.cuda.current_device())
+    print(
+        f"sweep device: {name} | wave_size={limits['wave_size']} "
+        f"max_threads={limits['max_threads']} "
+        f"lds_bytes={limits['lds_bytes'] or 'unknown'}"
+        f"{'' if _lds_guard_enabled() else ' (LDS guard disabled)'}"
+    )
+    print(f"sweep num_warps grid: {_warp_candidates()}")
+
 
 # Edge-block winners never exceed BLOCK_E = 8 on any swept width (the
 # per-edge register tile scales with BLOCK_E * C_wide, so larger blocks
@@ -494,7 +639,7 @@ def sweep_pointwise(
     for family, launch in kernels.items():
         best_ms, best_cfg = float("inf"), None
         for bm, w, s in itertools.product(
-            _BLOCK_M_CANDIDATES, _WARP_CANDIDATES, _STAGE_CANDIDATES
+            _BLOCK_M_CANDIDATES, _warp_candidates(), _STAGE_CANDIDATES
         ):
             try:
                 ms = _bench(lambda: launch(bm, w, s))
@@ -587,7 +732,9 @@ def sweep_point_train(
 
     best_ms, best_cfg = float("inf"), None
     for bm, w, st in itertools.product(
-        _BLOCK_M_CANDIDATES, (2, *_WARP_CANDIDATES), _STAGE_CANDIDATES
+        _BLOCK_M_CANDIDATES,
+        _warp_candidates((2, *_WARP_CANDIDATES_BASE)),
+        _STAGE_CANDIDATES,
     ):
         try:
             ms = _bench(lambda: launch(bm, w, st))
@@ -687,7 +834,9 @@ def sweep_gated_second_order(
 
     best_ms, best_cfg = float("inf"), None
     for bm, w, st in itertools.product(
-        _BLOCK_M_CANDIDATES, (2, *_WARP_CANDIDATES), _STAGE_CANDIDATES
+        _BLOCK_M_CANDIDATES,
+        _warp_candidates((2, *_WARP_CANDIDATES_BASE)),
+        _STAGE_CANDIDATES,
     ):
         try:
             ms = _bench(lambda: launch(bm, w, st))
@@ -805,7 +954,7 @@ def sweep_point_recompute(
 
     ranked: list[tuple[float, tuple[int, int, int]]] = []
     for config in itertools.product(
-        _BLOCK_M_CANDIDATES, _WARP_CANDIDATES, _STAGE_CANDIDATES
+        _BLOCK_M_CANDIDATES, _warp_candidates(), _STAGE_CANDIDATES
     ):
         bm, warps, stages = config
         try:
@@ -1247,8 +1396,9 @@ def _select_fp32_config(
         launch(_STACK_GEMM_DEFAULT)
     torch.cuda.synchronize()
 
+    launchable = _launchable_gemm_candidates(candidates)
     ranked: list[tuple[float, GemmConfig]] = []
-    for config in candidates:
+    for config in launchable:
         try:
             ranked.append(
                 (_bench(lambda config=config: launch(config), iters=6), config)
@@ -1632,7 +1782,7 @@ def sweep_m0_gate(
 
     block_k = 32 if m0 % 32 == 0 else 16
     ranked: list[tuple[float, tuple[int, int, int, int]]] = []
-    for bm, warps in itertools.product(_BLOCK_M_CANDIDATES, (4, 8)):
+    for bm, warps in itertools.product(_BLOCK_M_CANDIDATES, _warp_candidates((4, 8))):
         config = (bm, block_k, warps, 1)
 
         def launch() -> None:
@@ -1828,10 +1978,15 @@ def sweep_fp16x3(
     names = ("forward m0", "forward |m|=1", "backward m0", "backward |m|=1")
 
     # === Step 1. Rank every candidate per kernel by standalone time ===
+    # The fp16x3 kernels stage 2-byte operands, so the LDS bound uses the
+    # operand width rather than the fp32 accumulator width.
+    fp16x3_candidates = _launchable_gemm_candidates(
+        _FP16X3_GEMM_CANDIDATES, element_bytes=2
+    )
     ranked: dict[int, list[tuple[float, tuple]]] = {}
     for slot, launch in launchers.items():
         results = []
-        for cfg in _FP16X3_GEMM_CANDIDATES:
+        for cfg in fp16x3_candidates:
             try:
                 ms = _bench(lambda: launch(*cfg), iters=10)
             except triton.runtime.errors.OutOfResources:
@@ -2349,6 +2504,7 @@ def main() -> None:
     device = torch.device(args.device)
     if device.type == "cuda" and device.index is not None:
         torch.cuda.set_device(device)
+    _describe_sweep_device()
 
     if args.model is not None:
         from deepmd.pt_expt.model.get_model import (
