@@ -94,12 +94,16 @@ from __future__ import (
 )
 
 import functools
+import logging
+import os
 
 import torch
 
 from .tile_config_data import (
     BUILTIN_TILE_CONFIGS,
 )
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "GATE_BMM_MIN_FOCUS_DIM",
@@ -184,17 +188,84 @@ def _builtin_tables() -> dict[str, dict[tuple[int, int], tuple | None]]:
     return _builtin_tables_for_device(torch.cuda.current_device())
 
 
+def config_log_enabled() -> bool:
+    """Return whether launch-config resolution should be logged once per key.
+
+    Set ``DP_TRITON_CONFIG_LOG=1`` to make every ``family``/``key`` resolution
+    print the configuration it produced and where it came from.  A device
+    whose name has no built-in table silently falls back to the conservative
+    family default, which looks identical to a tuned run in the timings; this
+    log is what makes that fallback visible.  The switch is off by default and
+    never affects the resolved value.
+    """
+    raw = os.environ.get("DP_TRITON_CONFIG_LOG", "").strip().lower()
+    return raw not in ("", "0", "false", "no", "off")
+
+
+_RESOLUTION_LOG: set[tuple[str, tuple[int, int]]] = set()
+
+
+def _device_table_name() -> str:
+    """Return the built-in table name matching this device, or a marker."""
+    try:
+        device_name = torch.cuda.get_device_name(torch.cuda.current_device())
+    except (RuntimeError, AssertionError):
+        return "unavailable"
+    if device_name in BUILTIN_TILE_CONFIGS:
+        return device_name
+    prefixes = [
+        model_name
+        for model_name in BUILTIN_TILE_CONFIGS
+        if device_name.startswith(f"{model_name} ")
+    ]
+    return max(prefixes, key=len) if prefixes else f"none({device_name})"
+
+
+def _log_resolution(
+    family: str, key: tuple[int, int], config: tuple | None, source: str
+) -> None:
+    """Log one resolution line per key, at most once per process.
+
+    Instrumentation only: a logging failure must never change a kernel launch,
+    so the whole body is wrapped.  ``warning`` is used because the module's
+    logger has no handler by default and Python's last-resort handler prints
+    warning records to ``stderr`` -- the line shows up when ``DP_TRITON_CONFIG_LOG``
+    enables it, without a ``print`` in library code.
+    """
+    if (family, key) in _RESOLUTION_LOG or not config_log_enabled():
+        return
+    _RESOLUTION_LOG.add((family, key))
+    try:
+        log.warning(
+            "[dp-triton-config] family=%s key=%s device_table=%s source=%s config=%s",
+            family,
+            key,
+            _device_table_name(),
+            source,
+            config,
+        )
+    except Exception:
+        pass
+
+
 def _lookup(family: str, key: tuple[int, int]) -> tuple | None:
     """Resolve ``key`` through the runtime and built-in layers.
 
     A ``None`` result folds together an explicit ``None`` entry (the sweep
     ran and the family default is the measured optimum) and an absent key
     (never swept on this GPU): the caller behaves identically in both cases.
+    ``source`` in the optional resolution log tells the two apart.
     """
     runtime = _RUNTIME[family]
     if key in runtime:
+        _log_resolution(family, key, runtime[key], "runtime")
         return runtime[key]
-    return _builtin_tables().get(family, {}).get(key)
+    table = _builtin_tables().get(family, {})
+    if key in table:
+        _log_resolution(family, key, table[key], "builtin")
+        return table[key]
+    _log_resolution(family, key, None, "absent")
+    return None
 
 
 def _runtime_tile_configs(family: str) -> dict[tuple[int, int], tuple | None]:
